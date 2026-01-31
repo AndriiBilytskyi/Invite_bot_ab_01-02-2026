@@ -221,13 +221,13 @@ def load_sessions_from_json(path: Path) -> List[SessionCfg]:
     sessions: List[SessionCfg] = []
     for item in data:
         sessions.append(
-            SessionCfg(
-                session_name=str(item["session_name"]),
-                api_id=int(item["api_id"]),
-                api_hash=str(item["api_hash"]),
-                session_string=str(item["session_string"]),
-            )
-        )
+    SessionCfg(
+        session_name=str(item["session_name"]),
+        api_id=int(item["api_id"]),
+        api_hash=str(item["api_hash"]),
+        session_string=str(item["session_string"]) if item.get("session_string") else None,
+    )
+)
     if not sessions:
         raise ValueError("sessions.json пустой — добавьте хотя бы одну сессию.")
     return sessions
