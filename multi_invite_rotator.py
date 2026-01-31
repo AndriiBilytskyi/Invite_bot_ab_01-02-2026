@@ -361,14 +361,18 @@ def run() -> None:
     sessions = load_sessions_from_json(SESSIONS_JSON)
 
     clients: List[Client] = [
-        Client(
-            s.session_name,
-            api_id=s.api_id,
-            api_hash=s.api_hash,
-            session_string=s.session_string,
-            no_updates=True,
-            workdir=str(DATA_DIR),
-        )
+        kwargs = dict(
+    name=s.session_name,
+    api_id=s.api_id,
+    api_hash=s.api_hash,
+    no_updates=True,
+    workdir=str(DATA_DIR),
+)
+
+if s.session_string:
+    kwargs["session_string"] = s.session_string
+
+client = Client(**kwargs)
         for s in sessions
     ]
 
