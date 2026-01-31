@@ -361,25 +361,24 @@ def run() -> None:
     sessions = load_sessions_from_json(SESSIONS_JSON)
 
     clients: List[Client] = []
-for s in sessions:
-    kwargs = {
-        "name": s.session_name,
-        "api_id": s.api_id,
-        "api_hash": s.api_hash,
-        "no_updates": True,
-        "workdir": str(DATA_DIR),
-    }
+    for s in sessions:
+        kwargs = {
+            "name": s.session_name,
+            "api_id": s.api_id,
+            "api_hash": s.api_hash,
+            "no_updates": True,
+            "workdir": str(DATA_DIR),
+        }
+        # Вариант B: session_string обычно нет -> берём .session из workdir
+        if getattr(s, "session_string", None):
+            kwargs["session_string"] = s.session_string
 
-    # Вариант B: если session_string нет — Pyrogram возьмёт .session из workdir
-    if getattr(s, "session_string", None):
-        kwargs["session_string"] = s.session_string
+        clients.append(Client(**kwargs))
 
-    clients.append(Client(**kwargs))
-
-    # Стартуем все клиенты
+    # дальше у вас уже идёт запуск клиентов:
     for s, c in zip(sessions, clients):
         if not safe_start(c, s.session_name):
-            raise RuntimeError(f"Не удалось стартовать сессию {s.session_name}. Проверьте session_string/api_id/api_hash.")
+            raise RuntimeError(f"Не удалось стартовать сессию {s.session_name}.")
 
     ensure_log_header(LOG_CSV)
 
