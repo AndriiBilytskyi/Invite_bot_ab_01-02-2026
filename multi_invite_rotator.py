@@ -360,21 +360,21 @@ def run() -> None:
 
     sessions = load_sessions_from_json(SESSIONS_JSON)
 
-    clients: List[Client] = [
-        kwargs = dict(
-    name=s.session_name,
-    api_id=s.api_id,
-    api_hash=s.api_hash,
-    no_updates=True,
-    workdir=str(DATA_DIR),
-)
+    clients: List[Client] = []
+for s in sessions:
+    kwargs = {
+        "name": s.session_name,
+        "api_id": s.api_id,
+        "api_hash": s.api_hash,
+        "no_updates": True,
+        "workdir": str(DATA_DIR),
+    }
 
-if s.session_string:
-    kwargs["session_string"] = s.session_string
+    # Вариант B: если session_string нет — Pyrogram возьмёт .session из workdir
+    if getattr(s, "session_string", None):
+        kwargs["session_string"] = s.session_string
 
-client = Client(**kwargs)
-        for s in sessions
-    ]
+    clients.append(Client(**kwargs))
 
     # Стартуем все клиенты
     for s, c in zip(sessions, clients):
