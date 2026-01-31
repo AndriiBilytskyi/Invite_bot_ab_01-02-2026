@@ -56,12 +56,14 @@ TZ = ZoneInfo(APP_TZ)
 # =========================
 # DATA STRUCTURES
 # =========================
+from typing import Optional
+
 @dataclass
 class SessionCfg:
     session_name: str
     api_id: int
     api_hash: str
-    session_string: str
+    session_string: Optional[str] = None
 
 
 # =========================
