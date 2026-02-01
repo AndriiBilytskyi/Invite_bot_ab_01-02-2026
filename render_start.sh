@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eu
+set -o pipefail
 
 # 1) найти директорию секретов
 SECRET_DIR=""
@@ -57,3 +58,4 @@ echo "[boot] /var/data contents:"
 ls -la /var/data | sed -n "1,200p"
 
 exec python -u multi_invite_rotator.py
+
