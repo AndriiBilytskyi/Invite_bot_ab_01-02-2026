@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import csv
 import os
 import time
@@ -15,6 +14,7 @@ from pyrogram import Client, errors
 # =========================
 # CONFIG (через ENV можно переопределять)
 # =========================
+
 def _env_str(name: str, default: str) -> str:
     v = os.getenv(name)
     return v if v is not None and str(v).strip() != "" else default
@@ -39,13 +39,19 @@ USERNAME_CSV = Path(_env_str("CSV_PATH", str(DATA_DIR / "invite_unique_usernames
 LOG_CSV = Path(_env_str("LOG_CSV", str(DATA_DIR / "multi_invite_log.csv"))).expanduser()
 SESSIONS_JSON = Path(_env_str("SESSIONS_JSON", str(DATA_DIR / "sessions.json"))).expanduser()
 
+# Требования:
 BATCH_PER_SESSION = _env_int("BATCH_PER_SESSION", 5)
 DELAY_BETWEEN_USERNAMES_SEC = _env_int("DELAY_BETWEEN_USERNAMES_SEC", 5 * 60)   # 5 минут
 DELAY_BETWEEN_SESSIONS_SEC = _env_int("DELAY_BETWEEN_SESSIONS_SEC", 5 * 60)     # 5 минут
 MAX_DAILY_ADDED = _env_int("MAX_DAILY_ADDED", 100)
 
+# Быстрая пауза для "терминальных" причин
+FAST_SKIP_SLEEP_SEC = _env_int("FAST_SKIP_SLEEP_SEC", 1)  # <= по умолчанию 1 сек
+
+# "мягкая смена сети": перезапускать клиент между сессиями
 RECONNECT_BETWEEN_SESSIONS = _env_int("RECONNECT_BETWEEN_SESSIONS", 1) == 1
 
+# Таймзона для дневных лимитов/полуночи (важно на Render, там обычно UTC)
 APP_TZ = _env_str("APP_TZ", "Europe/Berlin")
 TZ = ZoneInfo(APP_TZ)
 
@@ -53,6 +59,7 @@ TZ = ZoneInfo(APP_TZ)
 # =========================
 # DATA STRUCTURES
 # =========================
+
 @dataclass
 class SessionCfg:
     session_name: str
@@ -87,6 +94,22 @@ def seconds_until_next_midnight() -> int:
 # =========================
 LOG_FIELDS = ["timestamp", "session", "username", "status", "reason"]
 
+# Причины, при которых повторять попытку бессмысленно (считаем "обработано")
+TERMINAL_NOT_ADDED_REASONS: Set[str] = {
+    "UsernameNotOccupied",
+    "UsernameInvalid",
+    "UserPrivacyRestricted",
+    "UserNotMutualContact",
+    "UserBannedInChannel",
+    "UserChannelsTooMuch",  # USER_CHANNELS_TOO_MUCH
+}
+
+# Причины, при которых делаем быструю паузу (не ждём 300 сек)
+FAST_SLEEP_REASONS: Set[str] = set(TERMINAL_NOT_ADDED_REASONS) | {
+    "UserAlreadyParticipant",
+    "already_in_group",  # статус
+}
+
 
 def ensure_log_header(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -119,16 +142,20 @@ def load_usernames(path: Path) -> List[str]:
             f"Укажите корректный путь через ENV CSV_PATH или положите файл рядом."
         )
 
+    # Пробуем utf-8-sig (часто после Excel), если не получится — utf-8
     for enc in ("utf-8-sig", "utf-8"):
         try:
             with path.open("r", newline="", encoding=enc) as f:
-                rows = list(csv.reader(f))
+                reader = csv.reader(f)
+                rows = list(reader)
             break
         except UnicodeDecodeError:
             continue
     else:
+        # последний шанс — latin-1, чтобы хотя бы прочитать
         with path.open("r", newline="", encoding="latin-1") as f:
-            rows = list(csv.reader(f))
+            reader = csv.reader(f)
+            rows = list(reader)
 
     if not rows:
         return []
@@ -142,7 +169,7 @@ def load_usernames(path: Path) -> List[str]:
             if h in ("username", "@username", "user", "nickname"):
                 col_idx = i
                 break
-        data_rows = rows[1:]
+        data_rows = rows[1:]  # пропускаем заголовок
 
     usernames: List[str] = []
     for r in data_rows:
@@ -154,6 +181,7 @@ def load_usernames(path: Path) -> List[str]:
         if u:
             usernames.append(u)
 
+    # уникализируем, сохраняя порядок
     seen: Set[str] = set()
     out: List[str] = []
     for u in usernames:
@@ -163,7 +191,13 @@ def load_usernames(path: Path) -> List[str]:
     return out
 
 
-def load_processed_success(log_path: Path) -> Set[str]:
+def load_processed(log_path: Path) -> Set[str]:
+    """
+    Возвращает usernames, которые уже обработаны и не должны попадать в очередь снова:
+      - added
+      - already_in_group
+      - not_added с терминальными причинами (UsernameNotOccupied и т.п.)
+    """
     processed: Set[str] = set()
     if not log_path.exists():
         return processed
@@ -171,10 +205,22 @@ def load_processed_success(log_path: Path) -> Set[str]:
     with log_path.open("r", newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            status = (row.get("status") or "").strip().lower()
+            status = (row.get("status") or "").strip()
+            reason = (row.get("reason") or "").strip()
             username = sanitize_username(row.get("username") or "")
-            if username and status in ("added", "already_in_group"):
+            if not username:
+                continue
+
+            st = status.lower()
+
+            if st in ("added", "already_in_group"):
                 processed.add(username)
+                continue
+
+            if st == "not_added" and reason in TERMINAL_NOT_ADDED_REASONS:
+                processed.add(username)
+                continue
+
     return processed
 
 
@@ -202,10 +248,8 @@ def load_sessions_from_json(path: Path) -> List[SessionCfg]:
             f"Sessions config not found: {path}\n"
             f"Создайте sessions.json (лучше как Secret File на Render)."
         )
-
     data = json.loads(path.read_text(encoding="utf-8"))
     sessions: List[SessionCfg] = []
-
     for item in data:
         sessions.append(
             SessionCfg(
@@ -215,7 +259,6 @@ def load_sessions_from_json(path: Path) -> List[SessionCfg]:
                 session_string=str(item["session_string"]) if item.get("session_string") else None,
             )
         )
-
     if not sessions:
         raise ValueError("sessions.json пустой — добавьте хотя бы одну сессию.")
     return sessions
@@ -251,17 +294,6 @@ def restart_client(client: Client, session_name: str, sleep_sec: int = 10) -> bo
 # =========================
 # INVITE CORE
 # =========================
-
-# Эти ошибки НЕ должны "ронять" бота. Просто логируем not_added и идём дальше.
-NON_FATAL_INVITE_ERRORS = (
-    errors.UsernameNotOccupied,     # UsernameNotOccupied
-    errors.UserNotMutualContact,    # UserNotMutualContact
-    errors.UserChannelsTooMuch,     # USER_CHANNELS_TOO_MUCH
-    errors.UserBannedInChannel,     # UserBannedInChannel
-    errors.UserPrivacyRestricted,   # UserPrivacyRestricted
-    errors.UsernameInvalid,
-)
-
 def invite_once(
     client: Client,
     session_name: str,
@@ -271,7 +303,7 @@ def invite_once(
     """
     Возвращает:
       - row для лога (строго с ключами LOG_FIELDS)
-      - sleep_sec: сколько нужно выждать (например FloodWait), иначе None
+      - extra_sleep_sec: сколько нужно выждать (например FloodWait), иначе None
     """
     ts = now_ts()
     username_clean = sanitize_username(username)
@@ -295,24 +327,54 @@ def invite_once(
             None,
         )
 
-    # ВАЖНО: все перечисленные ошибки — нефатальные → не падаем, просто продолжаем.
-    except NON_FATAL_INVITE_ERRORS as e:
+    except errors.UsernameInvalid:
         return (
-            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": type(e).__name__},
+            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": "UsernameInvalid"},
+            None,
+        )
+
+    except errors.UsernameNotOccupied:
+        return (
+            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": "UsernameNotOccupied"},
+            None,
+        )
+
+    except errors.UserPrivacyRestricted:
+        return (
+            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": "UserPrivacyRestricted"},
+            None,
+        )
+
+    except errors.UserNotMutualContact:
+        return (
+            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": "UserNotMutualContact"},
+            None,
+        )
+
+    except errors.UserBannedInChannel:
+        return (
+            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": "UserBannedInChannel"},
+            None,
+        )
+
+    except errors.UserChannelsTooMuch:
+        # USER_CHANNELS_TOO_MUCH
+        return (
+            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": "UserChannelsTooMuch"},
             None,
         )
 
     except errors.ChatAdminRequired:
         return (
-            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": "ChatAdminRequired (no rights to add members)"},
+            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": "ChatAdminRequired"},
             None,
         )
 
     except errors.PeerFlood:
-        # Telegram подозревает спам. Не "роняем" бот: логируем и делаем длинную паузу.
+        # Обычно означает, что Telegram подозревает спам. Лучше длинная пауза/сменить аккаунт.
         return (
             {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": "PeerFlood"},
-            max(3600, DELAY_BETWEEN_SESSIONS_SEC),
+            max(3600, int(DELAY_BETWEEN_SESSIONS_SEC)),  # минимум час
         )
 
     except errors.FloodWait as e:
@@ -323,19 +385,29 @@ def invite_once(
             wait_sec + 3,
         )
 
-    except errors.RPCError as e:
-        # Подстраховка: любые другие RPC-ошибки Telegram — не валим процесс.
-        return (
-            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": f"RPCError:{type(e).__name__}"},
-            None,
-        )
-
     except Exception as e:
-        # Финальный предохранитель: бот НЕ должен "ложиться" из-за одного username
         return (
             {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": f"Exception:{type(e).__name__}:{e}"},
             None,
         )
+
+
+def compute_base_sleep(row: Dict[str, str]) -> int:
+    """
+    Быстрая пауза для терминальных/безопасных причин,
+    иначе — стандартная пауза.
+    """
+    status = (row.get("status") or "").strip().lower()
+    reason = (row.get("reason") or "").strip()
+
+    # already_in_group — это статус, а не причина
+    if status == "already_in_group":
+        return max(1, int(FAST_SKIP_SLEEP_SEC))
+
+    if reason in FAST_SLEEP_REASONS:
+        return max(1, int(FAST_SKIP_SLEEP_SEC))
+
+    return max(1, int(DELAY_BETWEEN_USERNAMES_SEC))
 
 
 # =========================
@@ -348,10 +420,11 @@ def run() -> None:
     print(f"[{now_ts()}] LOG_CSV={LOG_CSV}")
     print(f"[{now_ts()}] SESSIONS_JSON={SESSIONS_JSON}")
 
-    sessions = load_sessions_from_json(SESSIONS_JSON)
+    sessions_all = load_sessions_from_json(SESSIONS_JSON)
 
-    clients: List[Client] = []
-    for s in sessions:
+    # Создаём клиентов и стартуем. Не падаем, если часть сессий не стартовала.
+    active_sessions: List[Tuple[SessionCfg, Client]] = []
+    for s in sessions_all:
         kwargs = {
             "name": s.session_name,
             "api_id": s.api_id,
@@ -359,13 +432,21 @@ def run() -> None:
             "no_updates": True,
             "workdir": str(DATA_DIR),
         }
-        if s.session_string:
+        if getattr(s, "session_string", None):
             kwargs["session_string"] = s.session_string
-        clients.append(Client(**kwargs))
 
-    for s, c in zip(sessions, clients):
-        if not safe_start(c, s.session_name):
-            raise RuntimeError(f"Не удалось стартовать сессию {s.session_name}.")
+        c = Client(**kwargs)
+        if safe_start(c, s.session_name):
+            active_sessions.append((s, c))
+        else:
+            # просто пропускаем эту сессию
+            try:
+                c.stop()
+            except Exception:
+                pass
+
+    if not active_sessions:
+        raise RuntimeError("Не удалось стартовать ни одну сессию. Проверьте sessions.json / session_string / API_ID/API_HASH.")
 
     ensure_log_header(LOG_CSV)
 
@@ -375,6 +456,7 @@ def run() -> None:
         while True:
             day = today_prefix()
             daily_added = load_daily_added_count(LOG_CSV, day)
+
             if daily_added >= MAX_DAILY_ADDED:
                 sleep_sec = seconds_until_next_midnight()
                 print(f"[{now_ts()}] Daily limit reached: {daily_added}/{MAX_DAILY_ADDED}. Sleep {sleep_sec}s until next midnight ({APP_TZ}).")
@@ -382,7 +464,7 @@ def run() -> None:
                 continue
 
             usernames_all = load_usernames(USERNAME_CSV)
-            processed = load_processed_success(LOG_CSV)
+            processed = load_processed(LOG_CSV)
             queue = [u for u in usernames_all if u not in processed]
 
             if not queue:
@@ -390,63 +472,60 @@ def run() -> None:
                 time.sleep(3600)
                 continue
 
-            s = sessions[session_idx]
-            c = clients[session_idx]
+            s, c = active_sessions[session_idx]
             batch = queue[:BATCH_PER_SESSION]
 
-            print(f"[{now_ts()}] === SESSION {session_idx+1}/{len(sessions)}: {s.session_name}. Batch={len(batch)}. DailyAdded={daily_added}/{MAX_DAILY_ADDED} ===")
+            print(f"[{now_ts()}] === SESSION {session_idx+1}/{len(active_sessions)}: {s.session_name}. Batch={len(batch)}. DailyAdded={daily_added}/{MAX_DAILY_ADDED} ===")
 
             for username in batch:
+                # актуализируем daily limit перед каждым действием
                 day = today_prefix()
                 daily_added = load_daily_added_count(LOG_CSV, day)
                 if daily_added >= MAX_DAILY_ADDED:
                     break
 
                 print(f"[{now_ts()}] [{s.session_name}] Try add: @{username}")
-
-                # Доп. предохранитель: даже если внутри что-то неожиданно выстрелит — бот не падает
-                try:
-                    row, extra_sleep = invite_once(c, s.session_name, GROUP, username)
-                except Exception as e:
-                    row = {
-                        "timestamp": now_ts(),
-                        "session": s.session_name,
-                        "username": sanitize_username(username),
-                        "status": "not_added",
-                        "reason": f"OuterException:{type(e).__name__}:{e}",
-                    }
-                    extra_sleep = None
-
+                row, extra_sleep = invite_once(c, s.session_name, GROUP, username)
                 append_log(LOG_CSV, row)
+
                 print(f"[{now_ts()}] [{s.session_name}] Result: {row['status']} / {row['reason']}")
 
                 if row["status"].lower() == "added":
                     daily_added += 1
 
+                # Если Telegram сказал ждать — ждем столько и НЕ добавляем сверху ещё 5 минут
                 if extra_sleep is not None:
                     print(f"[{now_ts()}] [{s.session_name}] Mandatory sleep {extra_sleep}s (Telegram limitation).")
                     time.sleep(max(1, int(extra_sleep)))
+                    # маленькая техническая пауза после обязательного ожидания
+                    time.sleep(1)
+                    continue
 
-                base_sleep = max(1, int(DELAY_BETWEEN_USERNAMES_SEC))
+                # Базовая пауза между usernames (быстрая для терминальных причин)
+                base_sleep = compute_base_sleep(row)
                 print(f"[{now_ts()}] [{s.session_name}] Sleep {base_sleep}s before next username.")
                 time.sleep(base_sleep)
 
+            # Пауза и переключение на следующую сессию
             print(f"[{now_ts()}] Switching to next session in {DELAY_BETWEEN_SESSIONS_SEC}s...")
             time.sleep(max(1, int(DELAY_BETWEEN_SESSIONS_SEC)))
 
-            if RECONNECT_BETWEEN_SESSIONS:
-                next_idx = (session_idx + 1) % len(sessions)
-                ns = sessions[next_idx]
-                nc = clients[next_idx]
+            # Перезапуск клиента между сессиями (если нужно)
+            if RECONNECT_BETWEEN_SESSIONS and len(active_sessions) > 1:
+                next_idx = (session_idx + 1) % len(active_sessions)
+                ns, nc = active_sessions[next_idx]
                 print(f"[{now_ts()}] Reconnect next session client: {ns.session_name}")
-                restart_client(nc, ns.session_name, sleep_sec=10)
+                ok = restart_client(nc, ns.session_name, sleep_sec=10)
+                if not ok:
+                    # не падаем — просто оставляем как есть, попробуем дальше
+                    print(f"[{now_ts()}] [WARN] Reconnect failed for {ns.session_name}, continue...")
 
-            session_idx = (session_idx + 1) % len(sessions)
+            session_idx = (session_idx + 1) % len(active_sessions)
 
     except KeyboardInterrupt:
         print(f"[{now_ts()}] Stopping by user (Ctrl+C).")
     finally:
-        for s, c in zip(sessions, clients):
+        for s, c in active_sessions:
             safe_stop(c, s.session_name)
 
 
