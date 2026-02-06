@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import csv
 import os
 import time
@@ -14,7 +15,6 @@ from pyrogram import Client, errors
 # =========================
 # CONFIG (через ENV можно переопределять)
 # =========================
-
 def _env_str(name: str, default: str) -> str:
     v = os.getenv(name)
     return v if v is not None and str(v).strip() != "" else default
@@ -39,16 +39,13 @@ USERNAME_CSV = Path(_env_str("CSV_PATH", str(DATA_DIR / "invite_unique_usernames
 LOG_CSV = Path(_env_str("LOG_CSV", str(DATA_DIR / "multi_invite_log.csv"))).expanduser()
 SESSIONS_JSON = Path(_env_str("SESSIONS_JSON", str(DATA_DIR / "sessions.json"))).expanduser()
 
-# Требования:
 BATCH_PER_SESSION = _env_int("BATCH_PER_SESSION", 5)
 DELAY_BETWEEN_USERNAMES_SEC = _env_int("DELAY_BETWEEN_USERNAMES_SEC", 5 * 60)   # 5 минут
 DELAY_BETWEEN_SESSIONS_SEC = _env_int("DELAY_BETWEEN_SESSIONS_SEC", 5 * 60)     # 5 минут
 MAX_DAILY_ADDED = _env_int("MAX_DAILY_ADDED", 100)
 
-# "мягкая смена сети": перезапускать клиент между сессиями
 RECONNECT_BETWEEN_SESSIONS = _env_int("RECONNECT_BETWEEN_SESSIONS", 1) == 1
 
-# Таймзона для дневных лимитов/полуночи (важно на Render, там обычно UTC)
 APP_TZ = _env_str("APP_TZ", "Europe/Berlin")
 TZ = ZoneInfo(APP_TZ)
 
@@ -56,8 +53,6 @@ TZ = ZoneInfo(APP_TZ)
 # =========================
 # DATA STRUCTURES
 # =========================
-from typing import Optional
-
 @dataclass
 class SessionCfg:
     session_name: str
@@ -124,20 +119,16 @@ def load_usernames(path: Path) -> List[str]:
             f"Укажите корректный путь через ENV CSV_PATH или положите файл рядом."
         )
 
-    # Пробуем utf-8-sig (часто после Excel), если не получится — utf-8
     for enc in ("utf-8-sig", "utf-8"):
         try:
             with path.open("r", newline="", encoding=enc) as f:
-                reader = csv.reader(f)
-                rows = list(reader)
+                rows = list(csv.reader(f))
             break
         except UnicodeDecodeError:
             continue
     else:
-        # последний шанс — latin-1, чтобы хотя бы прочитать
         with path.open("r", newline="", encoding="latin-1") as f:
-            reader = csv.reader(f)
-            rows = list(reader)
+            rows = list(csv.reader(f))
 
     if not rows:
         return []
@@ -151,7 +142,7 @@ def load_usernames(path: Path) -> List[str]:
             if h in ("username", "@username", "user", "nickname"):
                 col_idx = i
                 break
-        data_rows = rows[1:]  # пропускаем заголовок
+        data_rows = rows[1:]
 
     usernames: List[str] = []
     for r in data_rows:
@@ -163,7 +154,6 @@ def load_usernames(path: Path) -> List[str]:
         if u:
             usernames.append(u)
 
-    # уникализируем, сохраняя порядок
     seen: Set[str] = set()
     out: List[str] = []
     for u in usernames:
@@ -174,11 +164,6 @@ def load_usernames(path: Path) -> List[str]:
 
 
 def load_processed_success(log_path: Path) -> Set[str]:
-    """
-    Возвращает usernames, которые уже успешно обработаны:
-      - added
-      - already_in_group
-    """
     processed: Set[str] = set()
     if not log_path.exists():
         return processed
@@ -217,17 +202,20 @@ def load_sessions_from_json(path: Path) -> List[SessionCfg]:
             f"Sessions config not found: {path}\n"
             f"Создайте sessions.json (лучше как Secret File на Render)."
         )
+
     data = json.loads(path.read_text(encoding="utf-8"))
     sessions: List[SessionCfg] = []
+
     for item in data:
         sessions.append(
-    SessionCfg(
-        session_name=str(item["session_name"]),
-        api_id=int(item["api_id"]),
-        api_hash=str(item["api_hash"]),
-        session_string=str(item["session_string"]) if item.get("session_string") else None,
-    )
-)
+            SessionCfg(
+                session_name=str(item["session_name"]),
+                api_id=int(item["api_id"]),
+                api_hash=str(item["api_hash"]),
+                session_string=str(item["session_string"]) if item.get("session_string") else None,
+            )
+        )
+
     if not sessions:
         raise ValueError("sessions.json пустой — добавьте хотя бы одну сессию.")
     return sessions
@@ -263,6 +251,17 @@ def restart_client(client: Client, session_name: str, sleep_sec: int = 10) -> bo
 # =========================
 # INVITE CORE
 # =========================
+
+# Эти ошибки НЕ должны "ронять" бота. Просто логируем not_added и идём дальше.
+NON_FATAL_INVITE_ERRORS = (
+    errors.UsernameNotOccupied,     # UsernameNotOccupied
+    errors.UserNotMutualContact,    # UserNotMutualContact
+    errors.UserChannelsTooMuch,     # USER_CHANNELS_TOO_MUCH
+    errors.UserBannedInChannel,     # UserBannedInChannel
+    errors.UserPrivacyRestricted,   # UserPrivacyRestricted
+    errors.UsernameInvalid,
+)
+
 def invite_once(
     client: Client,
     session_name: str,
@@ -296,27 +295,10 @@ def invite_once(
             None,
         )
 
-    except errors.UsernameInvalid:
+    # ВАЖНО: все перечисленные ошибки — нефатальные → не падаем, просто продолжаем.
+    except NON_FATAL_INVITE_ERRORS as e:
         return (
-            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": "UsernameInvalid"},
-            None,
-        )
-
-    except errors.UsernameNotOccupied:
-        return (
-            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": "UsernameNotOccupied"},
-            None,
-        )
-
-    except errors.UserPrivacyRestricted:
-        return (
-            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": "UserPrivacyRestricted"},
-            None,
-        )
-
-    except errors.UserNotMutualContact:
-        return (
-            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": "UserNotMutualContact"},
+            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": type(e).__name__},
             None,
         )
 
@@ -327,10 +309,10 @@ def invite_once(
         )
 
     except errors.PeerFlood:
-        # Обычно означает, что Telegram подозревает спам. Лучше сделать длинную паузу/сменить аккаунт.
+        # Telegram подозревает спам. Не "роняем" бот: логируем и делаем длинную паузу.
         return (
             {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": "PeerFlood"},
-            max(3600, DELAY_BETWEEN_SESSIONS_SEC),  # минимум час
+            max(3600, DELAY_BETWEEN_SESSIONS_SEC),
         )
 
     except errors.FloodWait as e:
@@ -341,7 +323,15 @@ def invite_once(
             wait_sec + 3,
         )
 
+    except errors.RPCError as e:
+        # Подстраховка: любые другие RPC-ошибки Telegram — не валим процесс.
+        return (
+            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": f"RPCError:{type(e).__name__}"},
+            None,
+        )
+
     except Exception as e:
+        # Финальный предохранитель: бот НЕ должен "ложиться" из-за одного username
         return (
             {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": f"Exception:{type(e).__name__}:{e}"},
             None,
@@ -369,13 +359,10 @@ def run() -> None:
             "no_updates": True,
             "workdir": str(DATA_DIR),
         }
-        # Вариант B: session_string обычно нет -> берём .session из workdir
-        if getattr(s, "session_string", None):
+        if s.session_string:
             kwargs["session_string"] = s.session_string
-
         clients.append(Client(**kwargs))
 
-    # дальше у вас уже идёт запуск клиентов:
     for s, c in zip(sessions, clients):
         if not safe_start(c, s.session_name):
             raise RuntimeError(f"Не удалось стартовать сессию {s.session_name}.")
@@ -410,36 +397,43 @@ def run() -> None:
             print(f"[{now_ts()}] === SESSION {session_idx+1}/{len(sessions)}: {s.session_name}. Batch={len(batch)}. DailyAdded={daily_added}/{MAX_DAILY_ADDED} ===")
 
             for username in batch:
-                # актуализируем daily limit перед каждым действием
                 day = today_prefix()
                 daily_added = load_daily_added_count(LOG_CSV, day)
                 if daily_added >= MAX_DAILY_ADDED:
                     break
 
                 print(f"[{now_ts()}] [{s.session_name}] Try add: @{username}")
-                row, extra_sleep = invite_once(c, s.session_name, GROUP, username)
-                append_log(LOG_CSV, row)
 
+                # Доп. предохранитель: даже если внутри что-то неожиданно выстрелит — бот не падает
+                try:
+                    row, extra_sleep = invite_once(c, s.session_name, GROUP, username)
+                except Exception as e:
+                    row = {
+                        "timestamp": now_ts(),
+                        "session": s.session_name,
+                        "username": sanitize_username(username),
+                        "status": "not_added",
+                        "reason": f"OuterException:{type(e).__name__}:{e}",
+                    }
+                    extra_sleep = None
+
+                append_log(LOG_CSV, row)
                 print(f"[{now_ts()}] [{s.session_name}] Result: {row['status']} / {row['reason']}")
 
                 if row["status"].lower() == "added":
                     daily_added += 1
 
-                # Если Telegram сказал ждать — ждем столько
                 if extra_sleep is not None:
                     print(f"[{now_ts()}] [{s.session_name}] Mandatory sleep {extra_sleep}s (Telegram limitation).")
-                    time.sleep(extra_sleep)
+                    time.sleep(max(1, int(extra_sleep)))
 
-                # Базовая пауза между usernames
                 base_sleep = max(1, int(DELAY_BETWEEN_USERNAMES_SEC))
                 print(f"[{now_ts()}] [{s.session_name}] Sleep {base_sleep}s before next username.")
                 time.sleep(base_sleep)
 
-            # Пауза и переключение на следующую сессию
             print(f"[{now_ts()}] Switching to next session in {DELAY_BETWEEN_SESSIONS_SEC}s...")
             time.sleep(max(1, int(DELAY_BETWEEN_SESSIONS_SEC)))
 
-            # Перезапуск клиента между сессиями (если нужно)
             if RECONNECT_BETWEEN_SESSIONS:
                 next_idx = (session_idx + 1) % len(sessions)
                 ns = sessions[next_idx]
