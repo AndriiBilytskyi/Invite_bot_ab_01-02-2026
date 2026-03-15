@@ -42,15 +42,21 @@ SESSIONS_JSON = Path(_env_str("SESSIONS_JSON", str(DATA_DIR / "sessions.json")))
 STATE_JSON = Path(_env_str("STATE_JSON", str(DATA_DIR / "state.json"))).expanduser()
 
 BATCH_PER_SESSION = _env_int("BATCH_PER_SESSION", 5)
-DELAY_BETWEEN_USERNAMES_SEC = _env_int("DELAY_BETWEEN_USERNAMES_SEC", 5 * 60)   # 5 минут
-DELAY_BETWEEN_SESSIONS_SEC = _env_int("DELAY_BETWEEN_SESSIONS_SEC", 5 * 60)     # 5 минут
+DELAY_BETWEEN_USERNAMES_SEC = _env_int("DELAY_BETWEEN_USERNAMES_SEC", 5 * 60)   # 300 сек
+DELAY_BETWEEN_SESSIONS_SEC = _env_int("DELAY_BETWEEN_SESSIONS_SEC", 5 * 60)     # 300 сек
 MAX_DAILY_ADDED = _env_int("MAX_DAILY_ADDED", 100)
-FAST_SKIP_SLEEP_SEC = _env_int("FAST_SKIP_SLEEP_SEC", 1)                         # 1 секунда
+FAST_SKIP_SLEEP_SEC = _env_int("FAST_SKIP_SLEEP_SEC", 1)                         # 1 сек
 
 RECONNECT_BETWEEN_SESSIONS = _env_int("RECONNECT_BETWEEN_SESSIONS", 1) == 1
 
 APP_TZ = _env_str("APP_TZ", "Europe/Berlin")
 TZ = ZoneInfo(APP_TZ)
+
+# Задержки для подтверждения фактического вступления
+CONFIRM_CHECK_1 = _env_int("CONFIRM_CHECK_1", 2)
+CONFIRM_CHECK_2 = _env_int("CONFIRM_CHECK_2", 4)
+CONFIRM_CHECK_3 = _env_int("CONFIRM_CHECK_3", 6)
+CONFIRM_DELAYS = (CONFIRM_CHECK_1, CONFIRM_CHECK_2, CONFIRM_CHECK_3)
 
 
 # =========================
@@ -98,6 +104,7 @@ FAST_SKIP_REASONS = {
     "UserBannedInChannel",
     "UserChannelsTooMuch",
     "UserAlreadyParticipant",
+    "AddedNotConfirmed",
 }
 
 
@@ -167,7 +174,7 @@ def load_usernames(path: Path) -> List[str]:
         if u:
             usernames.append(u)
 
-    # уникализируем, сохраняя порядок
+    # уникализируем с сохранением порядка
     seen = set()
     out: List[str] = []
     for u in usernames:
@@ -180,6 +187,7 @@ def load_usernames(path: Path) -> List[str]:
 def load_daily_added_count(log_path: Path, day_prefix: str) -> int:
     if not log_path.exists():
         return 0
+
     cnt = 0
     with log_path.open("r", newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
@@ -274,6 +282,27 @@ def restart_client(client: Client, session_name: str, sleep_sec: int = 10) -> bo
 # =========================
 # INVITE CORE
 # =========================
+def _confirm_member_status(client: Client, group: str, user_id: int) -> Tuple[bool, Optional[str]]:
+    """
+    Проверяет, действительно ли пользователь состоит в группе.
+    """
+    last_error = None
+
+    for delay in CONFIRM_DELAYS:
+        time.sleep(max(1, int(delay)))
+        try:
+            member = client.get_chat_member(group, user_id)
+            status_str = str(getattr(member, "status", ""))
+            # Подтверждаем любое "живое" участие в группе
+            if any(x in status_str for x in ("MEMBER", "ADMINISTRATOR", "OWNER", "RESTRICTED")):
+                return True, status_str
+            last_error = f"unexpected_status:{status_str}"
+        except Exception as e:
+            last_error = f"{type(e).__name__}:{e}"
+
+    return False, last_error
+
+
 def invite_once(
     client: Client,
     session_name: str,
@@ -283,7 +312,7 @@ def invite_once(
     """
     Возвращает:
       - row для лога
-      - extra_sleep_sec: сколько ждать дополнительно (FloodWait / PeerFlood), иначе None
+      - extra_sleep_sec
     """
     ts = now_ts()
     username_clean = sanitize_username(username)
@@ -295,63 +324,144 @@ def invite_once(
         )
 
     try:
-        client.add_chat_members(chat_id=group, user_ids=[username_clean])
+        # 1) Резолвим username в user_id
+        user_obj = client.get_users(username_clean)
+        user_id = user_obj.id
+
+        # 2) Пытаемся добавить по user_id
+        client.add_chat_members(chat_id=group, user_ids=[user_id])
+
+        # 3) Подтверждаем фактическое членство
+        confirmed, check_info = _confirm_member_status(client, group, user_id)
+
+        if confirmed:
+            return (
+                {
+                    "timestamp": ts,
+                    "session": session_name,
+                    "username": username_clean,
+                    "status": "added",
+                    "reason": f"CONFIRMED:user_id={user_id};status={check_info}",
+                },
+                None,
+            )
+
         return (
-            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "added", "reason": "OK"},
+            {
+                "timestamp": ts,
+                "session": session_name,
+                "username": username_clean,
+                "status": "not_added",
+                "reason": f"AddedNotConfirmed:user_id={user_id};check={check_info or 'unknown'}",
+            },
             None,
         )
 
     except errors.UserAlreadyParticipant:
         return (
-            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "already_in_group", "reason": "UserAlreadyParticipant"},
+            {
+                "timestamp": ts,
+                "session": session_name,
+                "username": username_clean,
+                "status": "already_in_group",
+                "reason": "UserAlreadyParticipant",
+            },
             None,
         )
 
     except errors.UsernameInvalid:
         return (
-            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": "UsernameInvalid"},
+            {
+                "timestamp": ts,
+                "session": session_name,
+                "username": username_clean,
+                "status": "not_added",
+                "reason": "UsernameInvalid",
+            },
             None,
         )
 
     except errors.UsernameNotOccupied:
         return (
-            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": "UsernameNotOccupied"},
+            {
+                "timestamp": ts,
+                "session": session_name,
+                "username": username_clean,
+                "status": "not_added",
+                "reason": "UsernameNotOccupied",
+            },
             None,
         )
 
     except errors.UserPrivacyRestricted:
         return (
-            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": "UserPrivacyRestricted"},
+            {
+                "timestamp": ts,
+                "session": session_name,
+                "username": username_clean,
+                "status": "not_added",
+                "reason": "UserPrivacyRestricted",
+            },
             None,
         )
 
     except errors.UserNotMutualContact:
         return (
-            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": "UserNotMutualContact"},
+            {
+                "timestamp": ts,
+                "session": session_name,
+                "username": username_clean,
+                "status": "not_added",
+                "reason": "UserNotMutualContact",
+            },
             None,
         )
 
     except errors.UserBannedInChannel:
         return (
-            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": "UserBannedInChannel"},
+            {
+                "timestamp": ts,
+                "session": session_name,
+                "username": username_clean,
+                "status": "not_added",
+                "reason": "UserBannedInChannel",
+            },
             None,
         )
 
     except errors.UserChannelsTooMuch:
         return (
-            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": "UserChannelsTooMuch"},
+            {
+                "timestamp": ts,
+                "session": session_name,
+                "username": username_clean,
+                "status": "not_added",
+                "reason": "UserChannelsTooMuch",
+            },
             None,
         )
 
     except errors.ChatAdminRequired:
         return (
-            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": "ChatAdminRequired"},
+            {
+                "timestamp": ts,
+                "session": session_name,
+                "username": username_clean,
+                "status": "not_added",
+                "reason": "ChatAdminRequired",
+            },
             None,
         )
 
     except errors.PeerFlood:
         return (
-            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": "PeerFlood"},
+            {
+                "timestamp": ts,
+                "session": session_name,
+                "username": username_clean,
+                "status": "not_added",
+                "reason": "PeerFlood",
+            },
             max(3600, int(DELAY_BETWEEN_SESSIONS_SEC)),
         )
 
@@ -359,19 +469,37 @@ def invite_once(
         wait_sec = int(getattr(e, "value", 0) or 0)
         wait_sec = max(1, wait_sec)
         return (
-            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": f"FloodWait:{wait_sec}"},
+            {
+                "timestamp": ts,
+                "session": session_name,
+                "username": username_clean,
+                "status": "not_added",
+                "reason": f"FloodWait:{wait_sec}",
+            },
             wait_sec + 3,
         )
 
     except errors.RPCError as e:
         return (
-            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": f"RPCError:{type(e).__name__}"},
+            {
+                "timestamp": ts,
+                "session": session_name,
+                "username": username_clean,
+                "status": "not_added",
+                "reason": f"RPCError:{type(e).__name__}",
+            },
             None,
         )
 
     except Exception as e:
         return (
-            {"timestamp": ts, "session": session_name, "username": username_clean, "status": "not_added", "reason": f"Exception:{type(e).__name__}:{e}"},
+            {
+                "timestamp": ts,
+                "session": session_name,
+                "username": username_clean,
+                "status": "not_added",
+                "reason": f"Exception:{type(e).__name__}:{e}",
+            },
             None,
         )
 
@@ -384,6 +512,9 @@ def compute_base_sleep(row: Dict[str, str]) -> int:
         return max(1, int(FAST_SKIP_SLEEP_SEC))
 
     if reason in FAST_SKIP_REASONS:
+        return max(1, int(FAST_SKIP_SLEEP_SEC))
+
+    if reason.startswith("AddedNotConfirmed:"):
         return max(1, int(FAST_SKIP_SLEEP_SEC))
 
     return max(1, int(DELAY_BETWEEN_USERNAMES_SEC))
@@ -441,7 +572,7 @@ def run() -> None:
                 time.sleep(3600)
                 continue
 
-            # Если дошли до конца списка — ждём новые записи в CSV
+            # если курсор уже в конце файла
             if state["cursor"] >= len(usernames_all):
                 print(f"[{now_ts()}] Дошли до конца CSV (cursor={state['cursor']}, total={len(usernames_all)}). Жду 1 час.")
                 time.sleep(3600)
@@ -494,15 +625,13 @@ def run() -> None:
                 append_log(LOG_CSV, row)
                 print(f"[{now_ts()}] [{s.session_name}] Result: {row['status']} / {row['reason']}")
 
-                # ВАЖНО: двигаем курсор ВСЕГДА, чтобы идти по CSV последовательно,
-                # а не возвращаться к началу списка/букве A
+                # ВАЖНО: двигаем курсор всегда вперёд
                 state["cursor"] += 1
                 save_state(STATE_JSON, state)
 
                 if row["status"].lower() == "added":
                     daily_added += 1
 
-                # если Telegram сказал ждать — ждём только это время
                 if extra_sleep is not None:
                     print(f"[{now_ts()}] [{s.session_name}] Mandatory sleep {extra_sleep}s (Telegram limitation).")
                     time.sleep(max(1, int(extra_sleep)))
@@ -513,7 +642,7 @@ def run() -> None:
                 print(f"[{now_ts()}] [{s.session_name}] Sleep {base_sleep}s before next username.")
                 time.sleep(base_sleep)
 
-            # переключаемся на следующую сессию
+            # переключаем на следующую сессию
             state["session_idx"] = (state["session_idx"] + 1) % len(active_sessions)
             save_state(STATE_JSON, state)
 
